@@ -178,7 +178,9 @@ export default {
         const gid = await addDownload(
           this.info.downloadUrl,
           this.info.downloadHeaders,
-          this.info.fileName
+          this.info.fileName,
+          undefined,
+          this.info.relativeDir
         )
         this.$message.success('已发送到下载器，任务ID: ' + gid)
         this.dialogVisible = false

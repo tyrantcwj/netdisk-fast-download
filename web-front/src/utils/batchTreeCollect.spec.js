@@ -99,10 +99,31 @@ describe('batchTreeCollect helpers', () => {
     const ctx = await collectFolderFiles({
       folderData: root,
       maxDepth: 4,
+      pathSegments: ['root'],
       ...store
     })
     assert.equal(ctx.depthExceeded, false)
     assert.deepEqual(ctx.files.map((f) => f.fileName).sort(), ['a.txt', 'b.txt'])
+    const byName = Object.fromEntries(ctx.files.map((f) => [f.fileName, f.relativeDir]))
+    assert.equal(byName['a.txt'], 'root')
+    assert.equal(byName['b.txt'], 'root/nested')
+  })
+
+  it('sanitizes folder names so relative paths cannot escape the download directory', async () => {
+    const leaf = file('secret.txt')
+    const tricky = folder('../nested')
+    const root = folder('root')
+    const store = createStore(makeNode(root, [
+      makeNode(tricky, [makeNode(leaf)])
+    ]))
+    const ctx = await collectFolderFiles({
+      folderData: root,
+      maxDepth: 4,
+      pathSegments: ['root'],
+      ...store
+    })
+    assert.equal(ctx.files[0].relativeDir, 'root/_nested')
+    assert.equal(ctx.files[0].relativeDir.includes('..'), false)
   })
 
   it('default depth 5 expands four descendant folders then stops', async () => {
@@ -134,6 +155,7 @@ describe('batchTreeCollect helpers', () => {
     const ctx = await collectFolderFiles({
       folderData: root,
       maxDepth: DEFAULT_BATCH_MAX_DEPTH,
+      pathSegments: ['root'],
       getNode: store.getNode,
       ensureLoaded: async (node) => {
         loadedIds.push(node.data.fileName)
@@ -143,6 +165,7 @@ describe('batchTreeCollect helpers', () => {
     })
     assert.equal(ctx.depthExceeded, true)
     assert.deepEqual(ctx.files.map((f) => f.fileName), ['cap.txt'])
+    assert.equal(ctx.files[0].relativeDir, 'root/d1/d2/d3/d4/d5')
     assert.ok(!ctx.files.some((f) => f.fileName === 'skipped.txt'))
     assert.ok(loadedIds.includes('d4'))
     assert.ok(!loadedIds.includes('d5'))

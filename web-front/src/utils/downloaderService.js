@@ -3,6 +3,9 @@
  * 供 Home.vue、DirectoryTree.vue、DownloadDialog.vue 等共用
  */
 import axios from 'axios'
+import downloadPath from '@/utils/downloadPath'
+
+const { ariaOutName, joinDownloadDir, sanitizePathSegment, sanitizeRelativeDir } = downloadPath
 
 const STORAGE_KEY = 'nfd-aria2-local-config'
 
@@ -204,13 +207,14 @@ export async function autoDetect(rpcSecret = '') {
  * @param {Object} [headers] - 请求头 {cookie, referer, user-agent, ...}
  * @param {string} [fileName] - 输出文件名
  * @param {{ rpcUrl?: string, rpcSecret?: string, downloadDir?: string, downloaderType?: string }} [configOverride] - 覆盖配置
+ * @param {string} [relativeDir] - 相对下载目录，用于保留网盘文件夹结构
  * @returns {Promise<string>} 任务 ID / GID
  */
-export async function addDownload(downloadUrl, headers, fileName, configOverride) {
+export async function addDownload(downloadUrl, headers, fileName, configOverride, relativeDir) {
   const config = { ...getConfig(), ...configOverride }
 
   if (config.downloaderType === 'thunder') {
-    return addThunderDownload([{ url: downloadUrl, headers, fileName }], config)
+    return addThunderDownload([{ url: downloadUrl, headers, fileName, relativeDir }], config)
   }
 
   if (isGopeedUrl(config.rpcUrl)) {
@@ -226,7 +230,8 @@ export async function addDownload(downloadUrl, headers, fileName, configOverride
       req: { url: downloadUrl, extra: { header: extraHeader } },
       opt: {}
     }
-    if (config.downloadDir) body.opt.path = config.downloadDir
+    const gopeedOpts = buildGopeedOpts({ fileName, relativeDir }, config.downloadDir)
+    if (gopeedOpts) Object.assign(body.opt, gopeedOpts)
     const res = await callGopeedApi(base, config.rpcSecret, 'POST', '/api/v1/tasks', body, 10000)
     // Gopeed 返回 { code: 0, data: "task-id" }
     if (res && res.code !== undefined && res.code !== 0) throw new Error(res.message || 'Gopeed 发送失败')
@@ -243,7 +248,7 @@ export async function addDownload(downloadUrl, headers, fileName, configOverride
     }
     if (headerArray.length > 0) options.header = headerArray
   }
-  if (fileName) options.out = fileName
+  if (fileName || relativeDir) options.out = ariaOutName(fileName, relativeDir)
   if (config.downloadDir) options.dir = config.downloadDir
 
   const res = await callRpc(config.rpcUrl, config.rpcSecret, 'aria2.addUri', [[downloadUrl], options], 10000)
@@ -253,7 +258,7 @@ export async function addDownload(downloadUrl, headers, fileName, configOverride
 
 /**
  * 批量发送下载任务到下载器（aria2 用 system.multicall，gopeed 用 batch API，迅雷用 JS-SDK newTask）
- * @param {{ url: string, headers?: Object, fileName?: string }[]} tasks - 下载任务列表
+ * @param {{ url: string, headers?: Object, fileName?: string, relativeDir?: string }[]} tasks - 下载任务列表
  * @param {{ rpcUrl?: string, rpcSecret?: string, downloadDir?: string, downloaderType?: string }} [configOverride]
  * @returns {Promise<{ succeeded: number, failed: number, errors: string[] }>}
  */
@@ -261,7 +266,7 @@ export async function batchAddDownload(tasks, configOverride) {
   if (!tasks || tasks.length === 0) return { succeeded: 0, failed: 0, errors: [] }
   if (tasks.length === 1) {
     try {
-      await addDownload(tasks[0].url, tasks[0].headers, tasks[0].fileName, configOverride)
+      await addDownload(tasks[0].url, tasks[0].headers, tasks[0].fileName, configOverride, tasks[0].relativeDir)
       return { succeeded: 1, failed: 0, errors: [] }
     } catch (e) {
       return { succeeded: 0, failed: 1, errors: [e.message || '未知错误'] }
@@ -296,7 +301,7 @@ async function batchAddAria2(tasks, config) {
       }
       if (headerArray.length > 0) options.header = headerArray
     }
-    if (task.fileName) options.out = task.fileName
+    if (task.fileName || task.relativeDir) options.out = ariaOutName(task.fileName, task.relativeDir)
     if (config.downloadDir) options.dir = config.downloadDir
 
     const params = []
@@ -351,9 +356,8 @@ async function batchAddGopeed(tasks, config) {
       }
     }
     const item = { req: { url: task.url, extra: { header: extraHeader } } }
-    if (task.fileName) {
-      item.opts = { name: task.fileName }
-    }
+    const opts = buildGopeedOpts(task, config.downloadDir)
+    if (opts) item.opts = opts
     return item
   })
 
@@ -374,8 +378,22 @@ async function batchAddGopeed(tasks, config) {
 }
 
 /**
+ * Gopeed 的批量接口在单条任务带了 opts 时不会再合并外层 opts。
+ * 因此文件名和下载目录必须写在同一份 opts 里。
+ * 目录结构放进 name（如 Movie/Season1/a.mkv），path 只放用户配置的下载根目录。
+ */
+function buildGopeedOpts(task, downloadDir) {
+  const opts = {}
+  if (task && (task.fileName || task.relativeDir)) {
+    opts.name = ariaOutName(task.fileName, task.relativeDir)
+  }
+  if (downloadDir) opts.path = downloadDir
+  return Object.keys(opts).length > 0 ? opts : null
+}
+
+/**
  * 通过迅雷 JS-SDK 发送下载任务
- * @param {{ url: string, headers?: Object, fileName?: string }[]} tasks
+ * @param {{ url: string, headers?: Object, fileName?: string, relativeDir?: string }[]} tasks
  * @param {{ downloadDir?: string }} config
  * @returns {Promise<string>}
  */
@@ -398,20 +416,50 @@ function addThunderDownload(tasks, config) {
     if (lk === 'user-agent' && value) userAgent = value
   }
 
+  const groups = new Map()
+  for (const task of tasks) {
+    const rel = sanitizeRelativeDir(task.relativeDir)
+    if (!groups.has(rel)) groups.set(rel, [])
+    groups.get(rel).push(task)
+  }
+  const baseDir = (config.downloadDir || '').trim()
+  const entries = [...groups.entries()]
+
+  // 迅雷一次 newTask 只有一个下载目录。配置了下载目录时按目录分组，
+  // 每组落到对应子目录；没配目录时把相对路径写进文件名，尽量保住层级。
+  if (baseDir && entries.length > 1) {
+    for (const [rel, list] of entries) {
+      window.thunderLink.newTask(buildThunderParam(list, joinDownloadDir(baseDir, rel), false, referer, userAgent))
+    }
+    return Promise.resolve('thunder-ok')
+  }
+
+  const onlyRel = entries.length === 1 ? entries[0][0] : ''
+  const list = entries.length === 1 ? entries[0][1] : tasks
+  if (baseDir) {
+    window.thunderLink.newTask(buildThunderParam(list, joinDownloadDir(baseDir, onlyRel), false, referer, userAgent))
+  } else {
+    window.thunderLink.newTask(buildThunderParam(list, '', true, referer, userAgent))
+  }
+  return Promise.resolve('thunder-ok')
+}
+
+function buildThunderParam(tasks, downloadDir, embedPathInName, referer, userAgent) {
   const taskParam = {
     tasks: tasks.map(t => {
       const item = { url: t.url }
-      if (t.fileName) item.name = t.fileName
+      const name = embedPathInName
+        ? ariaOutName(t.fileName, t.relativeDir)
+        : (sanitizePathSegment(t.fileName) || t.fileName)
+      if (name) item.name = name
       return item
-    })
+    }),
+    threadCount: '1'
   }
-  if (config.downloadDir) taskParam.downloadDir = config.downloadDir
+  if (downloadDir) taskParam.downloadDir = downloadDir
   if (referer) taskParam.referer = referer
   if (userAgent) taskParam.userAgent = userAgent
-  taskParam.threadCount = '1'
-
-  window.thunderLink.newTask(taskParam)
-  return Promise.resolve('thunder-ok')
+  return taskParam
 }
 
 /**

@@ -116,7 +116,7 @@
                     <i class="fas fa-check-double"></i> 批量下载
                   </el-button>
                   <span v-else class="tree-toolbar-hint">
-                    {{ treeExpanding ? '正在展开并收集文件…' : `勾选文件夹将自动展开（最多 ${effectiveBatchMaxDepth} 层）` }}
+                    {{ treeExpanding ? '正在展开并收集文件…' : `勾选文件夹将自动展开（最多 ${effectiveBatchMaxDepth} 层），发送到下载器时保留目录结构` }}
                   </span>
                 </div>
                 <div class="tree-scroll-wrap" v-loading="treeExpanding">
@@ -266,7 +266,7 @@
                   <i class="fas fa-check-double"></i> 批量下载
                 </el-button>
                 <span v-else class="tree-toolbar-hint">
-                  {{ treeExpanding ? '正在展开并收集文件…' : `勾选文件夹将自动展开（最多 ${effectiveBatchMaxDepth} 层）` }}
+                  {{ treeExpanding ? '正在展开并收集文件…' : `勾选文件夹将自动展开（最多 ${effectiveBatchMaxDepth} 层），发送到下载器时保留目录结构` }}
                 </span>
               </div>
               <div class="tree-scroll-wrap" v-loading="treeExpanding">
@@ -455,6 +455,7 @@ import fileTypeUtils from '@/utils/fileTypeUtils'
 import DownloadDialog from '@/components/DownloadDialog.vue'
 import { testConnection, autoDetect, addDownload, batchAddDownload, getConfig, saveConfig } from '@/utils/downloaderService'
 import batchTreeCollect from '@/utils/batchTreeCollect'
+import downloadPath from '@/utils/downloadPath'
 
 const {
   DEFAULT_BATCH_MAX_DEPTH,
@@ -463,6 +464,13 @@ const {
   uniqueFiles,
   collectFolderFiles
 } = batchTreeCollect
+
+const {
+  joinRelativeDir,
+  folderSegmentsFromNode,
+  isStructuralFolder,
+  sanitizePathSegment
+} = downloadPath
 
 export default {
   name: 'DirectoryTree',
@@ -802,7 +810,10 @@ export default {
         if (response.data.code === 200 && response.data.data) {
           const info = response.data.data
           if (info.needDownloader) {
-            this.downloadInfo = info
+            this.downloadInfo = {
+              ...info,
+              relativeDir: this.relativeDirForFile(file)
+            }
             this.downloadDialogVisible = true
           } else if (info.downloadUrl) {
             // 服务端判断不需要下载器，直接跳转
@@ -892,7 +903,7 @@ export default {
           const resp = await axios.get(this.buildFileDownInfoUrl(tp.type, tp.param), { headers })
           const info = resp.data.data || resp.data
           if (info && info.downloadUrl) {
-            await addDownload(info.downloadUrl, info.downloadHeaders || {}, file.fileName)
+            await addDownload(info.downloadUrl, info.downloadHeaders || {}, file.fileName, undefined, this.relativeDirForFile(file))
             this.$message.success('已发送到下载器')
           } else {
             this.$message.error('获取下载信息失败')
@@ -901,7 +912,7 @@ export default {
           const rawUrl = file.parserUrl.startsWith('http') ? file.parserUrl : (window.location.origin + file.parserUrl)
           const url = this.appendToken(rawUrl)
           const headers = (file.extParameters && file.extParameters.downloadHeaders) || {}
-          await addDownload(url, headers, file.fileName)
+          await addDownload(url, headers, file.fileName, undefined, this.relativeDirForFile(file))
           this.$message.success('已发送到下载器')
         }
       } catch (error) {
@@ -1112,11 +1123,40 @@ export default {
       if (key && (info.checkedKeys || []).map(String).includes(key)) return true
       return (info.checkedNodes || []).some(n => getTreeNodeId(n) === key)
     },
+    currentRelativeDir() {
+      return joinRelativeDir(this.pathStack.slice(1).map(item => item && item.name))
+    },
+    pathSegmentsForFolder(folderData) {
+      const node = this.findTreeNode(folderData)
+      const segments = folderSegmentsFromNode(node)
+      if (isStructuralFolder(folderData)) {
+        const seg = sanitizePathSegment(folderData.fileName)
+        if (seg) segments.push(seg)
+      }
+      return segments
+    },
+    relativeDirForFile(file) {
+      if (!file) return ''
+      if (file.relativeDir) return file.relativeDir
+      if (this.viewMode !== 'tree') return this.currentRelativeDir()
+      const tree = this.getFileTree()
+      const node = tree && (tree.getNode(file) || this.findTreeNode(file))
+      if (!node) return ''
+      return joinRelativeDir(folderSegmentsFromNode(node))
+    },
     syncSelectedFilesFromTree(extraFiles = []) {
       const tree = this.getFileTree()
-      const fromTree = tree
-        ? tree.getCheckedNodes().filter(n => this.isDownloadableFile(n))
-        : []
+      const fromTree = []
+      if (tree) {
+        for (const data of tree.getCheckedNodes()) {
+          if (!this.isDownloadableFile(data)) continue
+          const node = tree.getNode(data)
+          fromTree.push({
+            ...data,
+            relativeDir: joinRelativeDir(folderSegmentsFromNode(node))
+          })
+        }
+      }
       this.selectedFiles = uniqueFiles([...fromTree, ...extraFiles])
     },
     enqueueFolderCollect(folderData) {
@@ -1148,6 +1188,7 @@ export default {
           folderData,
           depth: 0,
           maxDepth: this.effectiveBatchMaxDepth,
+          pathSegments: this.pathSegmentsForFolder(folderData),
           getNode: (data) => this.findTreeNode(data),
           ensureLoaded: (node) => this.ensureTreeNodeLoaded(node),
           isDownloadable: (data) => this.isDownloadableFile(data),
@@ -1181,7 +1222,10 @@ export default {
       if (idx >= 0) {
         this.selectedFiles.splice(idx, 1)
       } else {
-        this.selectedFiles.push(file)
+        this.selectedFiles.push({
+          ...file,
+          relativeDir: this.currentRelativeDir()
+        })
       }
     },
     onBatchClick(file) {
@@ -1194,7 +1238,10 @@ export default {
       this.toggleFileSelect(file)
     },
     selectAll() {
-      this.selectedFiles = this.currentFileList.filter(f => this.isDownloadableFile(f))
+      const relativeDir = this.currentRelativeDir()
+      this.selectedFiles = this.currentFileList
+        .filter(f => this.isDownloadableFile(f))
+        .map(f => ({ ...f, relativeDir }))
     },
     deselectAll() {
       this.selectedFiles = []
@@ -1282,13 +1329,19 @@ export default {
             downloadTasks.push({
               url: info.downloadUrl,
               headers: info.downloadHeaders || {},
-              fileName: file.fileName
+              fileName: file.fileName,
+              relativeDir: this.relativeDirForFile(file)
             })
           } else {
             const rawUrl = file.parserUrl.startsWith('http') ? file.parserUrl : (window.location.origin + file.parserUrl)
             const url = this.appendToken(rawUrl)
             const headers = (file.extParameters && file.extParameters.downloadHeaders) || {}
-            downloadTasks.push({ url, headers, fileName: file.fileName })
+            downloadTasks.push({
+              url,
+              headers,
+              fileName: file.fileName,
+              relativeDir: this.relativeDirForFile(file)
+            })
           }
         } catch (e) {
           console.error('准备下载任务失败:', file.fileName, e)

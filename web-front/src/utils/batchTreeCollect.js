@@ -7,7 +7,12 @@
  * - 当 depth < maxDepth 时继续展开子文件夹；默认 maxDepth = 5，
  *   即最多再向下展开 5 层（第 0/1/2/3/4 层会 load，第 5 层文件夹不再展开）。
  * - 触及上限时若仍有未加载/剩余子文件夹，标记 depthExceeded，由 UI 提示跳过。
+ *
+ * pathSegments 是「当前这个文件夹」相对分享根目录的路径（含自身）。
+ * 收集到的文件会带上 relativeDir，供下载器按原目录结构落盘。
  */
+
+const { appendFolderSegment, withRelativeDir } = require('./downloadPath')
 
 const DEFAULT_BATCH_MAX_DEPTH = 5
 
@@ -48,12 +53,17 @@ function isFolderNode(data) {
   return !!(data && data.fileType === 'folder')
 }
 
-function collectAlreadyLoadedFiles(node, isDownloadable, ctx) {
+function collectAlreadyLoadedFiles(node, isDownloadable, ctx, pathSegments) {
   for (const child of node.childNodes || []) {
     if (isDownloadable(child.data)) {
-      ctx.files.push(child.data)
+      ctx.files.push(withRelativeDir(child.data, pathSegments))
     } else if (isFolderNode(child.data) && child.loaded) {
-      collectAlreadyLoadedFiles(child, isDownloadable, ctx)
+      collectAlreadyLoadedFiles(
+        child,
+        isDownloadable,
+        ctx,
+        appendFolderSegment(pathSegments, child.data)
+      )
     }
   }
 }
@@ -78,6 +88,7 @@ function hasUnexploredFolders(node) {
  * @param {(data: object) => any} opts.getNode el-tree getNode
  * @param {(node: any) => Promise<any>} opts.ensureLoaded 展开并触发懒加载
  * @param {(data: object) => boolean} opts.isDownloadable
+ * @param {string[]} [opts.pathSegments] 当前文件夹的相对路径（含自身）
  * @param {Set<string>} [opts.visitedKeys]
  * @param {(data: object) => string} [opts.getKey]
  * @param {{ files: object[], depthExceeded: boolean }} [opts.ctx]
@@ -90,6 +101,7 @@ async function collectFolderFiles(opts) {
     getNode,
     ensureLoaded,
     isDownloadable,
+    pathSegments = [],
     getKey = getTreeNodeId,
     visitedKeys = new Set(),
     ctx = { files: [], depthExceeded: false }
@@ -103,10 +115,12 @@ async function collectFolderFiles(opts) {
   const node = getNode(folderData)
   if (!node) return ctx
 
+  const here = Array.isArray(pathSegments) ? pathSegments : []
+
   if (depth >= maxDepth) {
     // 未 load 的节点在真实 el-tree 中没有 childNodes，不能把预置子项算进去
     if (node.loaded) {
-      collectAlreadyLoadedFiles(node, isDownloadable, ctx)
+      collectAlreadyLoadedFiles(node, isDownloadable, ctx, here)
       if (hasUnexploredFolders(node)) {
         ctx.depthExceeded = true
       }
@@ -127,12 +141,13 @@ async function collectFolderFiles(opts) {
     const data = child.data
     if (!data) continue
     if (isDownloadable(data)) {
-      ctx.files.push(data)
+      ctx.files.push(withRelativeDir(data, here))
     } else if (isFolderNode(data)) {
       await collectFolderFiles({
         ...opts,
         folderData: data,
         depth: depth + 1,
+        pathSegments: appendFolderSegment(here, data),
         visitedKeys,
         ctx
       })
