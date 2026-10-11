@@ -95,6 +95,14 @@
             >
               <i class="fas fa-check-double"></i> 批量下载
             </el-button>
+            <el-button
+              type="info" size="small"
+              :loading="comparing"
+              @click="startLocalCompare"
+              style="margin-left: 10px;"
+            >
+              <i class="fas fa-folder-minus"></i> 对比本地
+            </el-button>
           </div>
         </div>
       </template>
@@ -107,14 +115,23 @@
                   <span class="tree-toolbar-title">
                     <i class="fas fa-sitemap" aria-hidden="true"></i> 文件树
                   </span>
-                  <el-button
-                    v-if="!batchMode"
-                    type="warning"
-                    size="small"
-                    @click="toggleBatchMode"
-                  >
-                    <i class="fas fa-check-double"></i> 批量下载
-                  </el-button>
+                  <span v-if="!batchMode" class="tree-toolbar-actions">
+                    <el-button
+                      type="warning"
+                      size="small"
+                      @click="toggleBatchMode"
+                    >
+                      <i class="fas fa-check-double"></i> 批量下载
+                    </el-button>
+                    <el-button
+                      type="info"
+                      size="small"
+                      :loading="comparing"
+                      @click="startLocalCompare"
+                    >
+                      <i class="fas fa-folder-minus"></i> 对比本地
+                    </el-button>
+                  </span>
                   <span v-else class="tree-toolbar-hint">
                     {{ treeExpanding ? '正在展开并收集文件…' : `勾选文件夹将自动展开（最多 ${effectiveBatchMaxDepth} 层），发送到下载器时保留目录结构` }}
                   </span>
@@ -246,6 +263,9 @@
                   <el-button type="warning" size="small" @click="toggleBatchMode">
                     <i class="fas fa-check-double"></i> 批量下载
                   </el-button>
+                  <el-button type="info" size="small" :loading="comparing" @click="startLocalCompare">
+                    <i class="fas fa-folder-minus"></i> 对比本地
+                  </el-button>
                 </div>
               </div>
             </pane>
@@ -257,14 +277,23 @@
                 <span class="tree-toolbar-title">
                   <i class="fas fa-sitemap" aria-hidden="true"></i> 文件树
                 </span>
-                <el-button
-                  v-if="!batchMode"
-                  type="warning"
-                  size="small"
-                  @click="toggleBatchMode"
-                >
-                  <i class="fas fa-check-double"></i> 批量下载
-                </el-button>
+                <span v-if="!batchMode" class="tree-toolbar-actions">
+                  <el-button
+                    type="warning"
+                    size="small"
+                    @click="toggleBatchMode"
+                  >
+                    <i class="fas fa-check-double"></i> 批量下载
+                  </el-button>
+                  <el-button
+                    type="info"
+                    size="small"
+                    :loading="comparing"
+                    @click="startLocalCompare"
+                  >
+                    <i class="fas fa-folder-minus"></i> 对比本地
+                  </el-button>
+                </span>
                 <span v-else class="tree-toolbar-hint">
                   {{ treeExpanding ? '正在展开并收集文件…' : `勾选文件夹将自动展开（最多 ${effectiveBatchMaxDepth} 层），发送到下载器时保留目录结构` }}
                 </span>
@@ -358,6 +387,9 @@
                 <el-button type="warning" size="small" @click="toggleBatchMode">
                   <i class="fas fa-check-double"></i> 批量下载
                 </el-button>
+                <el-button type="info" size="small" :loading="comparing" @click="startLocalCompare">
+                  <i class="fas fa-folder-minus"></i> 对比本地
+                </el-button>
               </div>
               <div v-if="batchMode" class="mobile-batch-footer">
                 <span class="tree-sidebar-count">已勾选 {{ selectedFiles.length }} 个文件</span>
@@ -437,6 +469,66 @@
         </div>
         <iframe :src="previewUrl" frameborder="0" class="preview-iframe"></iframe>
       </div>
+      <input
+        ref="localDirInput"
+        type="file"
+        class="local-dir-input"
+        webkitdirectory
+        directory
+        multiple
+        @change="onLocalDirInput"
+      />
+      <el-dialog
+        title="本地目录对比"
+        v-model="compareVisible"
+        width="680px"
+        :close-on-click-modal="false"
+      >
+        <div v-if="compareResult" class="compare-dialog">
+          <p class="compare-summary">{{ compareSummary }}</p>
+          <p class="compare-hint">对比的是整个分享。请选择和这个分享对应的本地文件夹，路径按下载时保留的目录结构匹配。</p>
+          <el-alert
+            v-if="compareResult.depthExceeded"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="`有超过 ${effectiveBatchMaxDepth} 层的文件夹未展开，对比可能不完整`"
+            style="margin-bottom: 10px;"
+          />
+          <el-alert
+            v-if="compareResult.failed > 0"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="`${compareResult.failed} 个文件夹读取失败，这些目录里的文件没有参与对比`"
+            style="margin-bottom: 10px;"
+          />
+          <div v-if="compareRows.length === 0" class="compare-empty">
+            本地已经包含网盘里扫描到的文件。
+          </div>
+          <div v-else class="compare-list">
+            <div v-for="row in compareRows" :key="row.status + ':' + row.relativePath" class="compare-row">
+              <el-tag :type="row.status === 'missing' ? 'danger' : 'warning'" size="small">{{ row.statusLabel }}</el-tag>
+              <span class="compare-path" :title="row.relativePath">{{ row.relativePath }}</span>
+              <span class="compare-size">{{ row.sizeText }}</span>
+            </div>
+          </div>
+        </div>
+        <template #footer>
+          <el-checkbox v-model="compareIncludeIncomplete" :disabled="!compareResult || compareResult.incomplete.length === 0">
+            包含未下完
+          </el-checkbox>
+          <el-button @click="copyMissingList" :disabled="compareRows.length === 0">复制列表</el-button>
+          <el-button
+            type="success"
+            :disabled="filesToRedownload.length === 0 || batchDownloading"
+            :loading="batchDownloading"
+            @click="sendMissingToDownloader"
+          >
+            发送缺少的文件到下载器
+          </el-button>
+        </template>
+      </el-dialog>
       <!-- 下载器命令弹窗（共享组件） -->
       <DownloadDialog
         v-model:visible="downloadDialogVisible"
@@ -456,6 +548,7 @@ import DownloadDialog from '@/components/DownloadDialog.vue'
 import { testConnection, autoDetect, addDownload, batchAddDownload, getConfig, saveConfig } from '@/utils/downloaderService'
 import batchTreeCollect from '@/utils/batchTreeCollect'
 import downloadPath from '@/utils/downloadPath'
+import folderCompare from '@/utils/folderCompare'
 
 const {
   DEFAULT_BATCH_MAX_DEPTH,
@@ -471,6 +564,8 @@ const {
   isStructuralFolder,
   sanitizePathSegment
 } = downloadPath
+
+const { compareCloudToLocal, walkShareFiles } = folderCompare
 
 export default {
   name: 'DirectoryTree',
@@ -534,7 +629,11 @@ export default {
       selectedFiles: [],
       batchDownloading: false,
       batchProgress: { current: 0, total: 0, failed: 0 },
-      treeExpanding: false
+      treeExpanding: false,
+      comparing: false,
+      compareVisible: false,
+      compareResult: null,
+      compareIncludeIncomplete: true
     }
   },
   computed: {
@@ -574,6 +673,35 @@ export default {
     effectiveBatchMaxDepth() {
       const depth = Number(this.batchMaxDepth)
       return Number.isFinite(depth) && depth >= 0 ? depth : DEFAULT_BATCH_MAX_DEPTH
+    },
+    compareRows() {
+      const result = this.compareResult
+      if (!result) return []
+      const missing = (result.missing || []).map(file => ({
+        ...file,
+        status: 'missing',
+        statusLabel: '缺少',
+        sizeText: file.sizeStr || this.formatByteSize(file.size)
+      }))
+      const incomplete = (result.incomplete || []).map(file => ({
+        ...file,
+        status: 'incomplete',
+        statusLabel: '未下完',
+        sizeText: `${this.formatByteSize(file.localSize)} / ${file.sizeStr || this.formatByteSize(file.cloudSize || file.size)}`
+      }))
+      return [...missing, ...incomplete]
+    },
+    filesToRedownload() {
+      const result = this.compareResult
+      if (!result) return []
+      const missing = result.missing || []
+      if (!this.compareIncludeIncomplete) return missing
+      return [...missing, ...(result.incomplete || [])]
+    },
+    compareSummary() {
+      const result = this.compareResult
+      if (!result) return ''
+      return `网盘 ${result.cloudCount} 个文件，本地已有 ${result.matched.length} 个，缺少 ${result.missing.length} 个，未下完 ${result.incomplete.length} 个`
     }
   },
   watch: {
@@ -1307,18 +1435,25 @@ export default {
       }
     },
     async batchSendToDownloader() {
-      if (this.selectedFiles.length === 0) return
+      return this.sendFileListToDownloader(this.selectedFiles)
+    },
+    async sendMissingToDownloader() {
+      return this.sendFileListToDownloader(this.filesToRedownload)
+    },
+    async sendFileListToDownloader(files) {
+      const list = files || []
+      if (list.length === 0) return
       // 先检测下载器连接（含自动检测）
       if (!await this.ensureDownloaderConnected()) return
 
       this.batchDownloading = true
-      const total = this.selectedFiles.length
+      const total = list.length
       this.batchProgress = { current: 0, total, failed: 0 }
 
       // needDownloader 文件走 getFileDownInfo 拿直链+cookie；其余发 parserUrl + headers
       const downloadTasks = []
       const apiHeaders = this.apiKeyHeaders()
-      for (const file of this.selectedFiles) {
+      for (const file of list) {
         try {
           if (this.needsDownloader(file)) {
             const tp = this.extractTypeParam(file)
@@ -1366,6 +1501,115 @@ export default {
         this.$message.warning(`${succeeded} 成功，${failed} 失败`)
       } else {
         this.$message.error('全部发送失败')
+      }
+    },
+    formatByteSize(size) {
+      const value = Number(size)
+      if (!Number.isFinite(value) || value < 0) return ''
+      if (value < 1024) return `${value}B`
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)}KB`
+      if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)}MB`
+      return `${(value / 1024 / 1024 / 1024).toFixed(2)}GB`
+    },
+    async startLocalCompare() {
+      if (this.comparing) return
+      if (typeof window.showDirectoryPicker === 'function') {
+        let handle = null
+        try {
+          handle = await window.showDirectoryPicker({ mode: 'read' })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+        }
+        if (handle) {
+          try {
+            const files = await this.readDirectoryHandle(handle)
+            await this.runLocalCompare(files)
+          } catch (error) {
+            console.error('读取本地文件夹失败:', error)
+            this.$message.error(error.message || '读取本地文件夹失败')
+          }
+          return
+        }
+      }
+      const input = this.$refs.localDirInput
+      if (!input) {
+        this.$message.error('当前浏览器不能选择本地文件夹')
+        return
+      }
+      input.value = ''
+      input.click()
+    },
+    async onLocalDirInput(event) {
+      const selected = Array.from((event.target && event.target.files) || [])
+      if (selected.length === 0) return
+      const files = selected.map(file => {
+        const parts = String(file.webkitRelativePath || file.name).split(/[\\/]+/).filter(Boolean)
+        if (parts.length > 1) parts.shift()
+        return { relativePath: parts.join('/'), size: file.size }
+      })
+      await this.runLocalCompare(files)
+    },
+    async readDirectoryHandle(handle, prefix = '') {
+      const files = []
+      for await (const [name, entry] of handle.entries()) {
+        const relativePath = prefix ? `${prefix}/${name}` : name
+        if (entry.kind === 'directory') {
+          files.push(...await this.readDirectoryHandle(entry, relativePath))
+        } else if (entry.kind === 'file') {
+          const file = await entry.getFile()
+          files.push({ relativePath, size: file.size })
+        }
+      }
+      return files
+    },
+    async fetchFolderEntries(folder) {
+      if (!folder || !folder.parserUrl) throw new Error('文件夹缺少访问链接')
+      const response = await axios.get(this.withAuth(folder.parserUrl), { headers: this.apiKeyHeaders() })
+      if (response.data.code !== 200) throw new Error(response.data.msg || '获取文件夹内容失败')
+      return response.data.data || []
+    },
+    async runLocalCompare(localFiles) {
+      this.comparing = true
+      try {
+        const ctx = await walkShareFiles({
+          entries: this.fileList || [],
+          maxDepth: this.effectiveBatchMaxDepth,
+          fetchChildren: (folder) => this.fetchFolderEntries(folder),
+          isDownloadable: (entry) => this.isDownloadableFile(entry)
+        })
+        const compared = compareCloudToLocal(ctx.files, localFiles)
+        this.compareResult = {
+          ...compared,
+          depthExceeded: ctx.depthExceeded,
+          failed: ctx.failed
+        }
+        this.compareVisible = true
+        if (ctx.depthExceeded) {
+          this.$message.warning(`已达到最大展开深度（${this.effectiveBatchMaxDepth} 层），更深层的文件未参与对比`)
+        }
+      } catch (error) {
+        console.error('对比本地目录失败:', error)
+        this.$message.error(error.message || '对比本地目录失败')
+      } finally {
+        this.comparing = false
+      }
+    },
+    async copyMissingList() {
+      const text = this.compareRows.map(row => `${row.statusLabel}\t${row.relativePath}`).join('\n')
+      if (!text) return
+      try {
+        await navigator.clipboard.writeText(text)
+        this.$message.success('缺少的文件列表已复制')
+      } catch {
+        const area = document.createElement('textarea')
+        area.value = text
+        area.style.position = 'fixed'
+        area.style.opacity = '0'
+        document.body.appendChild(area)
+        area.select()
+        document.execCommand('copy')
+        document.body.removeChild(area)
+        this.$message.success('缺少的文件列表已复制')
       }
     },
     renderContent(h, { node, data, store }) {
@@ -2277,5 +2521,55 @@ html, body, #app, .main-container, .directory-tree, .content-card {
     flex-direction: column;
     gap: 6px;
   }
+}
+.local-dir-input {
+  display: none;
+}
+.tree-toolbar-actions {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+}
+.compare-summary {
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+.compare-hint {
+  margin: 0 0 12px;
+  color: #909399;
+  font-size: 13px;
+}
+.compare-empty {
+  padding: 24px 0;
+  text-align: center;
+  color: #67c23a;
+}
+.compare-list {
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+  border-radius: 6px;
+}
+.compare-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--el-border-color-lighter, #ebeef5);
+}
+.compare-row:last-child {
+  border-bottom: none;
+}
+.compare-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compare-size {
+  flex: none;
+  color: #909399;
+  font-size: 12px;
 }
 </style>
